@@ -12,6 +12,10 @@ on:
         description: "Seed state without sending notifications (use on first run)"
         required: false
         default: "false"
+      test_ping:
+        description: "Send a single test notification and exit (verify ntfy works)"
+        required: false
+        default: "false"
 
 # Prevent overlapping runs from racing on the committed state file.
 concurrency:
@@ -41,8 +45,10 @@ jobs:
       - name: Run monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}   # optional; defaults to https://ntfy.sh
+          # NTFY_SERVER intentionally omitted — the script defaults to https://ntfy.sh.
+          # Only set it (and create the secret) if you self-host ntfy.
           SEED_ONLY: ${{ github.event.inputs.seed_only == 'true' && '1' || '0' }}
+          TEST_PING: ${{ github.event.inputs.test_ping == 'true' && '1' || '0' }}
         run: python monitor.py
 
       - name: Commit updated state

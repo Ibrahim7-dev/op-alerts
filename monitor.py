@@ -25,13 +25,24 @@ from playwright.sync_api import sync_playwright
 # This URL is the One Piece Card Game results. If P-Bandai changes their
 # category codes, update PBANDAI_URL (or override it via the env var) — any
 # search/brand URL that lists items will work with the scraper below.
+# PRIMARY: the brand landing page is confirmed working and shows ONLY One Piece
+# Card Game items (its "latest pre-order" / "closing soon" rails surface upcoming
+# items too). This is the reliable backbone of the monitor.
 LISTING_URL = os.environ.get(
     "PBANDAI_URL",
-    "https://p-bandai.com/us/search?keyword=ONE%20PIECE%20CARD%20GAME",
+    "https://p-bandai.com/us/brand/onepiececardgame/",
 )
-# Optional second URL scraped in the same run and merged (e.g. the brand page).
-# Leave blank to skip. Lets you cover both a search and the brand landing page.
-LISTING_URL_2 = os.environ.get("PBANDAI_URL_2", "https://p-bandai.com/us/brand/onepiececardgame/")
+# SECONDARY (optional): the BANDAI CARD SHOP search page, which lists card-game
+# products and is filtered by our title check to One Piece only. Scraped in the
+# same run and merged. The previously-used `?keyword=...` URL was NOT valid —
+# P-Bandai redirected it to a "PAGE NOT AVAILABLE" error page with no items — so
+# it has been removed. If you find a better coded URL in your browser (e.g. a
+# `?character=` or `?shop=` filter that shows exactly the items you want), set it
+# as the PBANDAI_URL_2 repo secret/variable. Leave blank to scrape only the brand page.
+LISTING_URL_2 = os.environ.get(
+    "PBANDAI_URL_2",
+    "https://p-bandai.com/us/search?shop=05-005",
+)
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")          # e.g. "pbandai-onepiece-x7k2"
 # NOTE: an unset GitHub secret is passed through as an EMPTY string, not absent,
@@ -54,6 +65,12 @@ TEST_PING = os.environ.get("TEST_PING", "0") == "1"
 # exact phrase in its title; nothing else does. So we require it (case-insensitive).
 # Override via env if you ever want a different franchise/line.
 TITLE_MUST_CONTAIN = os.environ.get("TITLE_MUST_CONTAIN", "ONE PIECE CARD GAME").upper()
+# Sanity floor: if a scrape returns fewer than this many matching items, we treat
+# the run as a failed/partial scrape rather than trusting it — this prevents a
+# search-page hiccup (which leaves only the ~3 brand-page items) from corrupting
+# the baseline on seed, or causing a flood of false "new item" alerts later when
+# the full catalog reappears. Tune via env if the real catalog is ever smaller.
+MIN_EXPECTED_ITEMS = int(os.environ.get("MIN_EXPECTED_ITEMS", "5"))
 # -----------------------------------------------------------------------------
 
 
@@ -124,52 +141,76 @@ def to_records(items: dict) -> dict:
     return {u: {"title": t, "status": parse_status(t)} for u, t in items.items()}
 
 
-def _scrape_one(page, url: str) -> dict:
-    """Scrape a single listing URL, returning {item_url: title}."""
+def _scrape_one(page, url: str, attempts: int = 2) -> dict:
+    """Scrape a single listing URL, returning {item_url: title}.
+
+    Retries once on failure, since the search page intermittently renders slowly
+    and a single 30s miss would otherwise drop the whole catalog for that run.
+    """
     found: dict[str, str] = {}
-    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-
-    # Dismiss the cookie banner if present — it can overlay/await interaction.
-    for label in ("Accept All Cookies (Only available to users aged 16 and over)",
-                  "Accept All Cookies", "Accept", "ACCEPT"):
+    for attempt in range(1, attempts + 1):
+        found = {}
         try:
-            btn = page.get_by_text(label, exact=False)
-            if btn and btn.count() > 0:
-                btn.first.click(timeout=2000)
-                break
-        except Exception:
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-    # Wait for product links to render. Item pages live at /us/item/N...
-    try:
-        page.wait_for_selector("a[href*='/us/item/']", timeout=30_000)
-    except Exception:
-        print(f"WARNING: no item links found at {url}", file=sys.stderr)
-        print(page.content()[:1500], file=sys.stderr)
-        return found
+            # Dismiss the cookie banner if present — it can overlay the grid.
+            for label in (
+                "Accept All Cookies (Only available to users aged 16 and over)",
+                "Accept All Cookies", "Accept", "ACCEPT",
+            ):
+                try:
+                    btn = page.get_by_text(label, exact=False)
+                    if btn and btn.count() > 0:
+                        btn.first.click(timeout=2000)
+                        break
+                except Exception:
+                    pass
 
-    # Scroll to bottom to trigger any lazy-loaded items, then settle.
-    try:
-        for _ in range(6):
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(600)
-    except Exception:
-        pass
-    page.wait_for_timeout(2000)
+            # Wait for product links to render. Item pages live at /us/item/N...
+            try:
+                page.wait_for_selector("a[href*='/us/item/']", timeout=25_000)
+            except Exception:
+                # As a fallback, let the network settle in case items render late.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
 
-    for a in page.query_selector_all("a[href*='/us/item/']"):
-        href = a.get_attribute("href") or ""
-        if "/us/item/" not in href:
-            continue
-        if href.startswith("/"):
-            href = "https://p-bandai.com" + href
-        href = href.split("?")[0].rstrip("/")
-        title = (a.get_attribute("aria-label") or a.inner_text() or "").strip()
-        title = " ".join(title.split())
-        if not title:
-            title = href.rsplit("/", 1)[-1]
-        if href not in found or len(title) > len(found[href]):
-            found[href] = title
+            # Scroll to trigger lazy-loaded items, then settle.
+            try:
+                for _ in range(6):
+                    page.mouse.wheel(0, 4000)
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+
+            for a in page.query_selector_all("a[href*='/us/item/']"):
+                href = a.get_attribute("href") or ""
+                if "/us/item/" not in href:
+                    continue
+                if href.startswith("/"):
+                    href = "https://p-bandai.com" + href
+                href = href.split("?")[0].rstrip("/")
+                title = (a.get_attribute("aria-label") or a.inner_text() or "").strip()
+                title = " ".join(title.split())
+                if not title:
+                    title = href.rsplit("/", 1)[-1]
+                if href not in found or len(title) > len(found[href]):
+                    found[href] = title
+
+            if found:
+                return found
+            # No items this attempt — log and (maybe) retry.
+            print(f"WARNING: no item links found at {url} "
+                  f"(attempt {attempt}/{attempts})", file=sys.stderr)
+            if attempt == attempts:
+                print(page.content()[:1200], file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR on {url} (attempt {attempt}/{attempts}): {e}",
+                  file=sys.stderr)
+        if attempt < attempts:
+            page.wait_for_timeout(3000)  # brief backoff before retry
     return found
 
 
@@ -191,6 +232,9 @@ def scrape_items() -> dict:
         for url in urls:
             try:
                 part = _scrape_one(page, url)
+                kept_here = sum(1 for t in part.values() if matches_filter(t))
+                print(f"  scraped {len(part)} item(s) from {url} "
+                      f"({kept_here} match the filter)")
                 for k, v in part.items():
                     if k not in items or len(v) > len(items[k]):
                         items[k] = v
@@ -248,7 +292,32 @@ def main() -> int:
         print("No items scraped; leaving state untouched.")
         return 1
 
+    # Guard against a partial scrape (e.g. search page failed, only the brand
+    # page's few featured items came back). Trusting it would corrupt the seed
+    # baseline or trigger false alerts later. We make an exception only when the
+    # prior state was itself this small, so a genuinely tiny catalog isn't stuck.
+    if len(current) < MIN_EXPECTED_ITEMS and len(current) < len(seen):
+        print(
+            f"Only {len(current)} item(s) scraped (< {MIN_EXPECTED_ITEMS} and "
+            f"fewer than the {len(seen)} already known) — treating as a partial "
+            f"scrape. State preserved, no notifications.",
+            file=sys.stderr,
+        )
+        return 1
+
     if SEED_ONLY or not seen:
+        if len(current) < MIN_EXPECTED_ITEMS:
+            # Warn but proceed: a genuinely small result on seed day shouldn't
+            # block setup. The shrinkage guard above is what protects ongoing
+            # runs from a partial-scrape flood; seeding a small set is recoverable
+            # (just re-seed later). Glance at the count to sanity-check it.
+            print(
+                f"NOTE: seeding only {len(current)} item(s) (below the "
+                f"{MIN_EXPECTED_ITEMS} soft floor). If you expected more, the "
+                f"secondary search URL may have failed this run — check the "
+                f"per-URL counts above and re-seed if needed.",
+                file=sys.stderr,
+            )
         save_seen(current)
         print(f"Seeded {len(current)} items (no notifications sent).")
         return 0

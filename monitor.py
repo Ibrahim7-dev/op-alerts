@@ -47,20 +47,81 @@ SEED_ONLY = os.environ.get("SEED_ONLY", "0") == "1"
 # TEST_PING=1 sends one test notification and exits, so you can confirm ntfy
 # delivery without hand-editing seen.json.
 TEST_PING = os.environ.get("TEST_PING", "0") == "1"
+
+# The search/brand listings pull in loosely-related items: Digimon "CARD GAME"
+# sets, One Piece figures (S.H.Figuarts / Portrait.Of.Pirates), even Gundam kits
+# from "recommended" rails. Every genuine One Piece Card Game product has this
+# exact phrase in its title; nothing else does. So we require it (case-insensitive).
+# Override via env if you ever want a different franchise/line.
+TITLE_MUST_CONTAIN = os.environ.get("TITLE_MUST_CONTAIN", "ONE PIECE CARD GAME").upper()
 # -----------------------------------------------------------------------------
 
 
+def matches_filter(title: str) -> bool:
+    """True if the item title contains the required phrase (case-insensitive)."""
+    return TITLE_MUST_CONTAIN in title.upper()
+
+
+# Known status phrases as they appear in titles, longest/most-specific first so
+# "OUT OF STOCK" is matched before a bare "STOCK" could ever interfere.
+STATUS_PHRASES = [
+    "OUT OF STOCK",
+    "SOLD OUT",
+    "PRE-ORDER CLOSED",
+    "PRE-ORDER",
+    "PREORDER",
+    "IN STOCK",
+    "COMING SOON",
+    "AVAILABLE",
+]
+
+
+def parse_status(title: str) -> str:
+    """Extract a normalized sales status from an item title.
+
+    Returns the matched phrase in upper case, or 'UNKNOWN' if none is present.
+    """
+    t = title.upper()
+    for phrase in STATUS_PHRASES:
+        if phrase in t:
+            # Normalize the two preorder spellings to one label.
+            if phrase == "PREORDER":
+                return "PRE-ORDER"
+            return phrase
+    return "UNKNOWN"
+
+
 def load_seen() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    """Load state as {url: {"title": str, "status": str}}.
+
+    Backward compatible with the old {url: title} format so an existing
+    seen.json keeps working without a manual reset.
+    """
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        return {}
+    normalized: dict = {}
+    for url, val in raw.items():
+        if isinstance(val, dict):
+            normalized[url] = {
+                "title": val.get("title", ""),
+                "status": val.get("status") or parse_status(val.get("title", "")),
+            }
+        else:  # old format: val is the title string
+            normalized[url] = {"title": val, "status": parse_status(val)}
+    return normalized
 
 
 def save_seen(seen: dict) -> None:
     STATE_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False))
+
+
+def to_records(items: dict) -> dict:
+    """Turn {url: title} from a scrape into {url: {title, status}}."""
+    return {u: {"title": t, "status": parse_status(t)} for u, t in items.items()}
 
 
 def _scrape_one(page, url: str) -> dict:
@@ -136,7 +197,15 @@ def scrape_items() -> dict:
             except Exception as e:  # noqa: BLE001
                 print(f"ERROR scraping {url}: {e}", file=sys.stderr)
         browser.close()
-    return items
+
+    # Filter to genuine One Piece Card Game items. We do this AFTER merging so an
+    # item with a blank title on one page but a full title on another is judged
+    # on its best-available title rather than wrongly dropped.
+    filtered = {u: t for u, t in items.items() if matches_filter(t)}
+    dropped = len(items) - len(filtered)
+    if dropped:
+        print(f"Filtered out {dropped} non-matching item(s); kept {len(filtered)}.")
+    return filtered
 
 
 def notify(title: str, message: str, url: str) -> None:
@@ -172,35 +241,58 @@ def main() -> int:
         print("Sent test ping.")
         return 0
 
-    seen = load_seen()
-    current = scrape_items()
+    seen = load_seen()                      # {url: {title, status}}
+    current = to_records(scrape_items())    # {url: {title, status}}
 
     if not current:
         print("No items scraped; leaving state untouched.")
         return 1
-
-    new_urls = [u for u in current if u not in seen]
 
     if SEED_ONLY or not seen:
         save_seen(current)
         print(f"Seeded {len(current)} items (no notifications sent).")
         return 0
 
-    if not new_urls:
-        print(f"No new items. ({len(current)} on page)")
+    new_urls = [u for u in current if u not in seen]
+    # Status changes on items we've already seen.
+    changed = [
+        u for u in current
+        if u in seen and current[u]["status"] != seen[u]["status"]
+    ]
+
+    if not new_urls and not changed:
+        print(f"No changes. ({len(current)} items on page)")
         save_seen({**seen, **current})
         return 0
 
-    print(f"Found {len(new_urls)} new item(s):")
-    for url in new_urls:
-        title = current[url]
-        print(f"  + {title} -> {url}")
-        notify(
-            title="New One Piece item on P-Bandai!",
-            message=title,
-            url=url,
-        )
-        time.sleep(1)
+    if new_urls:
+        print(f"Found {len(new_urls)} new item(s):")
+        for url in new_urls:
+            rec = current[url]
+            print(f"  + [{rec['status']}] {rec['title']} -> {url}")
+            notify(
+                title="New One Piece card item!",
+                message=rec["title"],
+                url=url,
+            )
+            time.sleep(1)
+
+    if changed:
+        print(f"Found {len(changed)} status change(s):")
+        for url in changed:
+            old = seen[url]["status"]
+            new = current[url]["status"]
+            rec = current[url]
+            print(f"  ~ {old} -> {new}: {rec['title']} -> {url}")
+            # Strip the trailing status off the title for a cleaner message,
+            # then state the transition explicitly.
+            base = rec["title"]
+            notify(
+                title=f"Status change: {old} -> {new}",
+                message=f"{base}",
+                url=url,
+            )
+            time.sleep(1)
 
     save_seen({**seen, **current})
     return 0

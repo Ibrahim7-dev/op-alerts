@@ -62,6 +62,33 @@ item appears, your phone buzzes; tapping the notification opens the product page
 
 ---
 
+
+## Filtering (which items count)
+The site's search and brand pages pull in loosely-related products — Digimon
+"CARD GAME" sets, One Piece **figures** (S.H.Figuarts, Portrait.Of.Pirates), and
+even Gundam kits from "recommended" rails. The monitor keeps only items whose
+title contains **`ONE PIECE CARD GAME`** (case-insensitive), which every genuine
+card-game product has and nothing else does. Figures use `F`-prefixed item IDs;
+real card items use `N`-prefixed IDs — but the title check is what's used, since
+the Digimon card set is also `N`-prefixed.
+
+To watch a different line, set a `TITLE_MUST_CONTAIN` repo secret/variable
+(e.g. `DRAGON BALL SUPER CARD GAME`). Each run logs how many items it filtered out.
+
+
+## Status-change alerts
+Beyond brand-new listings, the monitor also notifies when an existing item's
+**sales status changes** — e.g. `OUT OF STOCK -> PRE-ORDER`, `PRE-ORDER -> IN STOCK`,
+or a preorder reopening. The status is parsed from the item title (the labels the
+site shows: OUT OF STOCK, PRE-ORDER, IN STOCK, SOLD OUT, COMING SOON, etc.).
+
+Notes:
+- Each transition fires **once**; it won't re-alert every run while the status holds.
+- Price or wording tweaks in a title that *don't* change the status are ignored.
+- State is stored per item as `{title, status}`. An older `seen.json` in the
+  previous `url: title` format is upgraded automatically on first run — no reset
+  needed just for this change.
+
 ## Good to know / honest limits
 - **Timing:** GitHub's scheduled runs are *best-effort* and frequently run late
   when their infrastructure is busy — expect "every 5–15 min," not exact. Fine
